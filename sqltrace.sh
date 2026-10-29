@@ -10,12 +10,16 @@ umask 077   # в трейсах значения binds — это данные, 
 readonly PROG=${0##*/}
 readonly MAX_SECS=3600
 readonly SAMPLE_SECS=3
+readonly WATCHDOG_GRACE=120   # запас сверх -d, после которого сторож выключит трейс сам
+readonly MIN_FREE_MB=2048     # минимум свободного места в Diag Trace для event-режима
+readonly SETTLE_SECS=5        # пауза после выключения трейса перед сбором файлов
 
 SQL_ID="" CHILD=0 SECS=60 PDB="" OUT="" SESS="" SID="" SERIAL=""
 NO_10046=0 FORCE=0 RATE_LIMIT=200
-TRACE_ON=0 MODE="" MARKER="" SESS_TRACE=""
+TRACE_ON=0 MODE="" MARKER="" SESS_TRACE="" WATCHDOG_PID=""
+declare -A TRC_SIZE=()        # размер *.trc до включения трейса: отличаем новые данные от старых
 
-declare -A TK=([sort]=exeela,fchela,prsela [sys]=no [waits]=yes [aggregate]=yes)
+declare -A TK=([sort]="exeela,fchela,prsela" [sys]=no [waits]=yes [aggregate]=yes)
 declare -a TK_ORDER=(sort sys waits aggregate)
 
 usage() {
@@ -114,9 +118,13 @@ parse_args() {
 validate() {
   [[ -n $SQL_ID || -n $SESS ]] || { usage >&2; exit 2; }
   [[ -z $SQL_ID || $SQL_ID =~ ^[0-9a-z]{13}$ ]] || die "sql_id: 13 символов [0-9a-z]"
-  [[ $CHILD =~ ^[0-9]+$ ]] || die "child_number: целое >= 0"
-  [[ $SECS =~ ^[0-9]+$ ]] && (( SECS >= 1 && SECS <= MAX_SECS )) || die "-d: 1..$MAX_SECS"
-  [[ $RATE_LIMIT =~ ^[0-9]+$ ]] || die "-r: целое"
+  # 10#: иначе "08"/"09" — ошибка octal, а внутри if (( )) она молча даёт false
+  # (так -r 09 отключал порог RATE)
+  [[ $CHILD =~ ^[0-9]{1,9}$ ]] || die "child_number: целое >= 0"
+  [[ $SECS =~ ^[0-9]{1,9}$ ]] || die "-d: 1..$MAX_SECS"
+  [[ $RATE_LIMIT =~ ^[0-9]{1,9}$ ]] || die "-r: целое"
+  CHILD=$((10#$CHILD)) SECS=$((10#$SECS)) RATE_LIMIT=$((10#$RATE_LIMIT))
+  (( SECS >= 1 && SECS <= MAX_SECS )) || die "-d: 1..$MAX_SECS"
   [[ -z $PDB || $PDB =~ ^[A-Za-z][A-Za-z0-9_]{0,127}$ ]] || die "некорректное имя PDB"
   if [[ -n $SESS ]]; then
     [[ $SESS =~ ^([0-9]+),([0-9]+)$ ]] || die "-S: SID,SERIAL"
@@ -141,6 +149,11 @@ validate() {
 
 # ---------------------------------------------------------------- 10046
 enable_trace() {
+  # TRACE_ON и сторож — ДО alter system: Ctrl+C между успешным alter и
+  # присваиванием оставлял event включённым на весь инстанс. Повторное "off"
+  # для невключённого трейса безвредно.
+  TRACE_ON=1
+  start_watchdog
   case $MODE in
     event) sql <<'SQL' >/dev/null
 alter system set events 'sql_trace[SQL: @SQL_ID@] wait=true, bind=true, plan_stat=all_executions';
@@ -156,16 +169,15 @@ end;
 SQL
     ;;
   esac
-  TRACE_ON=1
 }
 
-disable_trace() {
+disable_sql() {
   case $MODE in
-    event) sql <<'SQL' >/dev/null
+    event) render <<'SQL'
 alter system set events 'sql_trace[SQL: @SQL_ID@] off';
 SQL
     ;;
-    session) sql <<'SQL' >/dev/null
+    session) render <<'SQL'
 begin
   dbms_monitor.session_trace_disable(session_id => @SID@, serial_num => @SERIAL@);
 exception
@@ -175,19 +187,55 @@ end;
 SQL
     ;;
   esac
+}
+
+disable_trace() {
+  disable_sql | sql >/dev/null
   TRACE_ON=0
+}
+
+# Сторож — отдельный фоновый процесс: переживает kill -9 скрипта, обрыв ssh
+# (HUP игнорируется) и OOM-killer, после которых EXIT-trap не выполняется и
+# event остался бы включённым до рестарта инстанса. SIGINT фоновым процессам
+# неинтерактивного bash и так игнорируется, т.е. Ctrl+C его не трогает.
+# setsid не используем: его нет в части образов (util-linux).
+start_watchdog() {
+  local f="$OUT/.watchdog_off.sql"
+  {
+    printf '%s\n' 'whenever sqlerror exit failure'
+    disable_sql
+    printf '%s\n' 'exit'
+  } >"$f"
+  # shellcheck disable=SC2016  # $1..$3 раскрывает дочерний bash
+  bash -c 'trap "" HUP; trap "kill \$s 2>/dev/null; exit 0" TERM
+           sleep "$1" & s=$!; wait "$s" || exit 0
+           "$2" -S -L / as sysdba @"$3"' watchdog \
+    "$((SECS + WATCHDOG_GRACE))" "$SQLPLUS" "$f" \
+    </dev/null >>"$OUT/.watchdog.log" 2>&1 &
+  WATCHDOG_PID=$!
+}
+
+stop_watchdog() {
+  [[ -n $WATCHDOG_PID ]] || return 0
+  kill "$WATCHDOG_PID" 2>/dev/null || true
+  WATCHDOG_PID=""
 }
 
 cleanup() {
   local rc=$?
   if (( TRACE_ON )); then
     log "выключаю трейс после прерывания"
-    disable_trace || log "WARNING: трейс НЕ выключен — выключите вручную!"
+    if ! disable_trace; then
+      # сторож НЕ гасим: он повторит выключение через ${SECS}+${WATCHDOG_GRACE}s
+      log "WARNING: трейс НЕ выключен; сторож pid=$WATCHDOG_PID повторит попытку. Вручную:"
+      disable_sql >&2
+      WATCHDOG_PID=""
+    fi
   fi
+  stop_watchdog
   if [[ -n $MARKER ]]; then rm -f "$MARKER"; fi
   exit "$rc"
 }
-
 exec_count() {
   sql <<'SQL'
 select nvl(sum(executions), 0) from v$sql where sql_id = '@SQL_ID@';
@@ -215,11 +263,19 @@ SQL
       sleep "$SAMPLE_SECS"
       e2=$(exec_count)
       rate=$(( (e2 - e1) / SAMPLE_SECS ))
+      (( rate >= 0 )) || rate=0   # курсор вытеснили/перезагрузили между замерами
       log "sql_id $SQL_ID: ~${rate} exec/s"
       (( e2 > 0 )) || log "WARNING: курсора нет в shared pool — за окно захвата может не выполниться ни разу"
       if (( rate > RATE_LIMIT && ! FORCE )); then
         die "~${rate} exec/s > порога ${RATE_LIMIT}: event-трейс затронет все сессии. Уменьшите -d, используйте -S или -f"
       fi
+      local free_mb
+      free_mb=$(df -Pm -- "$TRACE_DIR" | awk 'NR == 2 { print $4 }')
+      if (( free_mb < MIN_FREE_MB )); then
+        (( FORCE )) || die "в $TRACE_DIR свободно ${free_mb}MB < ${MIN_FREE_MB}MB: заполнение diag dest остановит запись трейсов (и alert). -f — игнорировать"
+        log "WARNING: в $TRACE_DIR свободно ${free_mb}MB"
+      fi
+      snapshot_trace_sizes
       ;;
     session)
       local row server status cur
@@ -232,10 +288,19 @@ SQL
 )
       [[ -n $row ]] || die "сессия $SID,$SERIAL не найдена"
       IFS='|' read -r server status cur SESS_TRACE <<<"$row"
+      if [[ -f $SESS_TRACE ]]; then TRC_SIZE[$SESS_TRACE]=$(stat -c %s -- "$SESS_TRACE"); fi
       log "сессия $SID,$SERIAL: $server/$status, текущий sql_id=$cur"
       [[ $server == DEDICATED ]] || log "WARNING: $server server — трейс размажется по разным процессам, соберётся не всё"
       ;;
   esac
+}
+
+# stat по всем *.trc: O(N файлов), без чтения содержимого
+snapshot_trace_sizes() {
+  local f sz
+  while IFS=$'\t' read -r sz f; do
+    TRC_SIZE[$f]=$sz
+  done < <(find "$TRACE_DIR" -maxdepth 1 -type f -name '*.trc' -printf '%s\t%p\n')
 }
 
 capture() {
@@ -247,17 +312,36 @@ capture() {
   trap 'exit 130' INT
 }
 
+# Трейс-файл процесса копится всю жизнь сессии: данные прошлых захватов
+# попадут в tkprof/SUMMARY. Предупреждаем, если до начала захвата файл уже был.
+warn_stale() {
+  local f=$1 off=${TRC_SIZE[$1]:-0} what
+  (( off > 0 )) || return 0
+  what="трейс"
+  [[ -n $SQL_ID ]] && what="трейс $SQL_ID"
+  # grep -q < <(...), а не pipe: с pipefail SIGPIPE у head дал бы ложный "не найдено"
+  if [[ -z $SQL_ID ]] || grep -q -F "sqlid='$SQL_ID'" < <(head -c "$off" -- "$f"); then
+    log "WARNING: ${f##*/} содержит $what и до начала захвата (${off} байт) — tkprof/SUMMARY учтут и его"
+  fi
+}
+
 collect_10046() {
   local -a files=()
   case $MODE in
     event)
-      mapfile -t files < <(
-        find "$TRACE_DIR" -maxdepth 1 -type f -name '*.trc' -newer "$MARKER" -print0 \
-          | xargs -0 -r grep -l -F "sqlid='$SQL_ID'" || true
-      )
+      # PARSING IN CURSOR (единственное место с sqlid=) пишется один раз на
+      # курсор в сессии: при повторном захвате в том же процессе новых строк
+      # с sqlid= нет, поэтому ищем по всему файлу. Если sqlid был и до начала
+      # захвата — предупреждаем: tkprof/SUMMARY учтут и прошлый трейс.
+      local f
+      while IFS= read -r -d '' f; do
+        grep -q -F "sqlid='$SQL_ID'" -- "$f" || continue
+        files+=("$f")
+        warn_stale "$f"
+      done < <(find "$TRACE_DIR" -maxdepth 1 -type f -name '*.trc' -newer "$MARKER" -print0)
       ;;
     session)
-      if [[ -s $SESS_TRACE ]]; then files=("$SESS_TRACE"); fi
+      if [[ -s $SESS_TRACE ]]; then files=("$SESS_TRACE"); warn_stale "$SESS_TRACE"; fi
       ;;
   esac
   (( ${#files[@]} )) || { log "WARNING: трейсов 10046 не найдено"; return 0; }
@@ -285,29 +369,48 @@ summarize_10046() {
   local -a prfs=("$OUT"/10046/*.prf)
   [[ -e ${prfs[0]} ]] || return 0
   awk -v id="$SQL_ID" '
-    BEGIN { printf "%-60s %8s %10s %10s %10s %12s %10s\n",
-                   "file", "count", "cpu", "elapsed", "disk", "query", "rows" }
+    BEGIN { printf "%-60s %8s %10s %10s %10s %12s %12s %10s\n",
+                   "file", "count", "cpu", "elapsed", "disk", "query", "current", "rows" }
     $0 ~ "^SQL ID: " id { hit = 1; next }
     hit && /^total/ {
       n = FILENAME; sub(/.*\//, "", n)
-      printf "%-60s %8d %10.2f %10.2f %10d %12d %10d\n", n, $2, $3, $4, $5, $6, $8
-      c += $2; cpu += $3; ela += $4; dsk += $5; q += $6; r += $8; hit = 0
+      printf "%-60s %8d %10.2f %10.2f %10d %12d %12d %10d\n", n, $2, $3, $4, $5, $6, $7, $8
+      c += $2; cpu += $3; ela += $4; dsk += $5; q += $6; cur += $7; r += $8; hit = 0
     }
-    END { printf "%-60s %8d %10.2f %10.2f %10d %12d %10d\n",
-                 "TOTAL", c, cpu, ela, dsk, q, r }
+    END { printf "%-60s %8d %10.2f %10.2f %10d %12d %12d %10d\n",
+                 "TOTAL", c, cpu, ela, dsk, q, cur, r }
   ' "${prfs[@]}" >"$OUT/10046/SUMMARY.txt"
 }
 
 # ---------------------------------------------------------------- 10053
 dump_10053() {
+  # Курсор в PDB, а мы в CDB$ROOT: v$sql в root видит курсоры всех PDB, поэтому
+  # проверка проходила, а DUMP_TRACE из root молча писал трейс без 10053.
+  if [[ -z $PDB ]]; then
+    local -a pdbs
+    mapfile -t pdbs < <(sql <<'SQL'
+select distinct c.name
+  from v$sql s
+  join v$containers c on c.con_id = s.con_id
+ where s.sql_id = '@SQL_ID@' and s.child_number = @CHILD@ and s.con_id > 1;
+SQL
+)
+    case ${#pdbs[@]} in
+      0) ;;
+      1) PDB=${pdbs[0]}; log "курсор живёт в PDB $PDB" ;;
+      *) die "курсор $SQL_ID/$CHILD есть в нескольких PDB (${pdbs[*]}): укажите -p" ;;
+    esac
+  fi
+
+  # Путь берём отдельным SELECT, а не dbms_output: DUMP_TRACE внутри PDB
+  # сбрасывает буфер dbms_output сессии, и путь терялся (трейс при этом есть).
   local trc
   trc=$(
     {
       if [[ -n $PDB ]]; then echo 'alter session set container = @PDB@;'; fi
       cat <<'SQL'
 declare
-  l_cnt   pls_integer;
-  l_trace v$diag_info.value%type;
+  l_cnt pls_integer;
 begin
   select count(*) into l_cnt
     from v$sql
@@ -321,44 +424,53 @@ begin
     p_child_number => @CHILD@,
     p_component    => 'Compiler',
     p_file_id      => 'DUMP_@SQL_ID@_@CHILD@');
-
-  select value into l_trace from v$diag_info where name = 'Default Trace File';
-  dbms_output.put_line(l_trace);
 end;
 /
+select value from v$diag_info where name = 'Default Trace File';
 SQL
-    } | sql
+    } | sql | tail -n 1
   )
   [[ -s $trc ]] || die "трейс 10053 не создан: '$trc'"
 
   mkdir -p "$OUT/10053"
   cp -p -- "$trc" "$OUT/10053/"
   extract_10053 "$OUT/10053/${trc##*/}" >"$OUT/10053/SUMMARY.txt"
+  grep -q '^===== Plan =====' "$OUT/10053/SUMMARY.txt" \
+    || log "WARNING: в ${trc##*/} нет плана 10053 — проверьте PDB (-p) и child (-c)"
   log "10053: ${trc##*/}"
 }
 
 # Best-effort выжимка из 10053: финальный запрос, peeked binds, план, outline.
+# "UNPARSED QUERY IS" встречается после каждой трансформации; финальный —
+# последний "Final query after transformations".
 extract_10053() {
   awk '
-    function hdr(t) { printf "\n===== %s =====\n", t }
-    !q && /UNPARSED QUERY IS/ {
-      q = 1; hdr("Final query after transformations")
-      if ((getline line) > 0) print line
+    function hdr(t) { return sprintf("\n===== %s =====\n", t) }
+    /^Final query after transformations/ {
+      fq = ""
+      if ((getline line) > 0) fq = line
       next
     }
-    !b && /^Peeked values of the binds in SQL statement/ { b = 1; inb = 1; hdr("Peeked binds"); next }
+    !b && /^Peeked values of the binds in SQL statement/ { b = 1; inb = 1; next }
     inb {
+      if ($0 ~ /^\*+$/ || (binds == "" && $0 ~ /^[[:space:]]*$/)) next
       if ($0 ~ /^[[:space:]]*$/ || ++bn > 300) inb = 0
-      else if ($0 !~ /^\*+$/) print
+      else binds = binds $0 "\n"
       next
     }
-    !p && /^Plan Table$/ { p = 1; inp = 1; hdr("Plan"); next }
+    !p && /^Plan Table$/ { p = 1; inp = 1; next }
     inp {
       if ($0 ~ /^(Content of other_xml|[[:space:]]*Outline Data:)/ || ++pn > 500) inp = 0
-      else if ($0 !~ /^=+$/) { print; next }
+      else if ($0 !~ /^=+$/) { plan = plan $0 "\n"; next }
     }
-    !o && /BEGIN_OUTLINE_DATA/ { o = 1; ino = 1; hdr("Outline") }
-    ino { print; if (/END_OUTLINE_DATA/) ino = 0 }
+    !o && /BEGIN_OUTLINE_DATA/ { o = 1; ino = 1 }
+    ino { outl = outl $0 "\n"; if (/END_OUTLINE_DATA/) ino = 0 }
+    END {
+      if (fq != "")   printf "%s%s\n", hdr("Final query after transformations"), fq
+      if (b)          printf "%s%s", hdr("Peeked binds"), binds
+      if (p)          printf "%s%s", hdr("Plan"), plan
+      if (o)          printf "%s%s", hdr("Outline"), outl
+    }
   ' "$1"
 }
 
@@ -380,6 +492,9 @@ main() {
     enable_trace
     capture
     disable_trace
+    # alter system set events ... off доходит до чужих сессий асинхронно (на
+    # границе вызова): длинный PL/SQL-вызов пишет трейс ещё несколько секунд
+    sleep "$SETTLE_SECS"
     collect_10046
   fi
 
